@@ -23,6 +23,7 @@ services:
         condition: service_healthy
     environment:
       DATABASE_DSN: postgresql://fault_ro:fault_ro@db:5432/faultdb
+      MONITOR_DSN: postgresql://fault_mon:fault_mon@db:5432/faultdb
       POOL_SIZE: "2"
     ports:
       - "8000:8000"

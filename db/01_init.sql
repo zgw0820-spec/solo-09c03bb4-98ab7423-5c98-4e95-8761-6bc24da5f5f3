@@ -40,3 +40,17 @@ REVOKE ALL ON SCHEMA public FROM fault_ro;
 GRANT USAGE ON SCHEMA public TO fault_ro;
 GRANT SELECT ON fault_logs TO fault_ro;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM fault_ro;
+
+-- 锁等待诊断专用的只读监测角色：独立于查询池的第三条连接使用，
+-- pg_monitor 允许读取 pg_stat_activity / pg_locks 等监测视图，
+-- 本身没有任何数据写权限。
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fault_mon') THEN
+        CREATE ROLE fault_mon LOGIN;
+    END IF;
+END
+$$;
+ALTER ROLE fault_mon PASSWORD 'fault_mon';
+ALTER ROLE fault_mon SET default_transaction_read_only = on;
+GRANT pg_monitor TO fault_mon;

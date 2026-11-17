@@ -35,3 +35,14 @@ class QueryTimeout(QueryServiceError):
 
     code = "query_timeout"
     http_status = 504
+
+
+class DiagnosticsUnavailable(QueryServiceError):
+    """Raised when lock diagnostics cannot be produced honestly.
+
+    The monitoring connection is down or its query failed; the caller must
+    report "cannot diagnose" instead of returning a fabricated empty list.
+    """
+
+    code = "diagnostics_unavailable"
+    http_status = 503

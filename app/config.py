@@ -34,6 +34,15 @@ class Settings:
     )
     pool_size: int = _int("POOL_SIZE", 2)
     connect_timeout: float = _float("CONNECT_TIMEOUT", 10.0)
+    # Dedicated monitoring connection (separate fault_mon role) used only by
+    # the lock-wait diagnostics endpoint; never drawn from the query pool.
+    monitor_dsn: str = os.environ.get(
+        "MONITOR_DSN",
+        "postgresql://fault_mon:fault_mon@db:5432/faultdb",
+    )
+    # Budget for a single diagnostics catalogue query; exceeding it is
+    # reported as diagnostics_unavailable, never as an empty result.
+    monitor_query_timeout: float = _float("MONITOR_QUERY_TIMEOUT", 5.0)
     # Server-side statement_timeout acts only as a backstop.  It is set
     # slightly beyond the request deadline so application-side cancellation
     # is the primary mechanism and the backstop fires only if that fails.

@@ -16,10 +16,18 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .config import settings
+from .diagnostics import collect_lock_waits
 from .errors import InvalidDeadlineError, QueryServiceError
 from .executor import QueryExecutor
+from .monitor import LockMonitor
 from .pool import QueryConnectionPool
-from .schemas import HealthResponse, QueryRequest, QueryResponse
+from .registry import InFlightRegistry
+from .schemas import (
+    HealthResponse,
+    LockWaitDiagnosticsResponse,
+    QueryRequest,
+    QueryResponse,
+)
 from .validation import validate_single_select
 
 logging.basicConfig(
@@ -29,16 +37,21 @@ logging.basicConfig(
 logger = logging.getLogger("api")
 
 pool = QueryConnectionPool(settings)
-executor = QueryExecutor(pool, settings)
+registry = InFlightRegistry()
+executor = QueryExecutor(pool, settings, registry)
+monitor = LockMonitor(settings)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Eagerly open both connections at startup; close them on shutdown.
+    # Eagerly open both query connections at startup; the diagnostics
+    # monitor connects best-effort (it reconnects lazily on demand).
     await pool.open()
+    await monitor.open()
     try:
         yield
     finally:
+        await monitor.close()
         await pool.close()
 
 
@@ -120,3 +133,24 @@ async def query(body: QueryRequest) -> QueryResponse:
     # acquire_timeout; an execution deadline as a 504 query_timeout.
     result = await executor.execute(sql, deadline)
     return QueryResponse(**result)
+
+
+@app.get(
+    "/diagnostics/lock-waits",
+    response_model=LockWaitDiagnosticsResponse,
+    tags=["运维"],
+    responses={
+        503: {"description": "监测连接不可用，无法诊断（非空结果占位）"},
+    },
+)
+async def lock_wait_diagnostics() -> LockWaitDiagnosticsResponse:
+    """锁等待诊断：关联本服务在途请求与 PostgreSQL 后端。
+
+    仅报告**确认处于锁等待**的本服务请求（``wait_event_type='Lock'`` 或
+    ``pg_blocking_pids`` 非空）：排队中的请求没有后端、正常执行的 SQL
+    不算锁等待，均不会出现在 ``lock_waits`` 中。诊断走独立的只读监测
+    连接（``fault_mon`` 角色），两条查询连接都忙时仍可用；监测连接故障
+    时返回 503 ``diagnostics_unavailable``，绝不返回虚假的空结果。
+    """
+    report = await collect_lock_waits(registry, monitor)
+    return LockWaitDiagnosticsResponse(**report)

@@ -27,16 +27,23 @@ from typing import Any
 import psycopg
 
 from .config import Settings
-from .errors import QueryTimeout
+from .errors import PoolAcquireTimeout, QueryTimeout
 from .pool import QueryConnectionPool
+from .registry import InFlightRegistry
 
 logger = logging.getLogger("executor")
 
 
 class QueryExecutor:
-    def __init__(self, pool: QueryConnectionPool, settings: Settings) -> None:
+    def __init__(
+        self,
+        pool: QueryConnectionPool,
+        settings: Settings,
+        registry: InFlightRegistry | None = None,
+    ) -> None:
         self._pool = pool
         self._settings = settings
+        self._registry = registry if registry is not None else InFlightRegistry()
 
     async def execute(self, sql: str, deadline: float) -> dict[str, Any]:
         """Execute one validated read-only statement against the pool.
@@ -44,15 +51,44 @@ class QueryExecutor:
         A dead-on-arrival backend (e.g. terminated out-of-band while idle)
         is discarded and rebuilt, then the read-only statement is retried
         once within the same total deadline.
+
+        The request is tracked in the in-flight registry from entry until
+        the connection leaves our hands, so the diagnostics endpoint can
+        correlate it with its PostgreSQL backend.  Deregistration always
+        happens *before* the connection is released or discarded, and state
+        changes are token-guarded, so a timed-out/retried request is never
+        attributed to a backend that has since been re-borrowed.
         """
+        request_id = self._registry.enqueue(sql)
+        try:
+            return await self._execute_tracked(sql, deadline, request_id)
+        finally:
+            # Backstop: no registration may survive this request, whatever
+            # path was taken above.
+            self._registry.finish(request_id)
+
+    async def _execute_tracked(
+        self, sql: str, deadline: float, request_id: str
+    ) -> dict[str, Any]:
         last_conn_error: psycopg.Error | None = None
         for attempt in (1, 2):
             wait_started = time.monotonic()
             # Propagate PoolAcquireTimeout as a 503 receipt.  When this
             # raises, no connection was borrowed and no statement was sent.
-            conn = await self._pool.acquire(deadline)
+            try:
+                conn = await self._pool.acquire(deadline)
+            except PoolAcquireTimeout as exc:
+                exc.extra.update(
+                    {
+                        "request_id": request_id,
+                        "status": "queued_expired",
+                        "executed": False,
+                    }
+                )
+                raise
             waited_ms = round((time.monotonic() - wait_started) * 1000, 3)
             acquired_at = time.monotonic()
+            token = self._registry.attach(request_id, conn.info.backend_pid)
 
             async def _run() -> list[tuple[Any, ...]]:
                 # Server-side backstop, deliberately *after* the request
@@ -86,14 +122,15 @@ class QueryExecutor:
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 raise await self._handle_timeout(
-                    conn, task, waited_ms, acquired_at
+                    conn, task, waited_ms, acquired_at, request_id, token
                 )
             except psycopg.errors.QueryCanceled as exc:
                 # The server-side statement_timeout backstop fired first.
                 # Same recovery protocol, same 504 receipt.
                 logger.warning("statement_timeout backstop fired: %s", exc)
                 raise await self._handle_timeout(
-                    conn, task, waited_ms, acquired_at, backstop=True
+                    conn, task, waited_ms, acquired_at, request_id, token,
+                    backstop=True,
                 )
             except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
                 # Connection-level failure (backend terminated/restarted):
@@ -101,6 +138,9 @@ class QueryExecutor:
                 # remains.  Retry is safe because the statement is read-only
                 # and never committed anything on a dead connection.
                 logger.warning("connection-level error, discarding: %s", exc)
+                # Unbind first: the dead backend must no longer be
+                # attributed to this request while it re-queues.
+                self._registry.detach(request_id, token)
                 await self._pool.discard_and_replace(conn)
                 last_conn_error = exc
                 if deadline - time.monotonic() <= 0:
@@ -108,14 +148,19 @@ class QueryExecutor:
                 continue
             except psycopg.Error:
                 # Statement-level error: roll back, verify IDLE, then reuse.
+                self._registry.finish(request_id, token)
                 await self._rollback_or_discard(conn)
                 raise
 
             elapsed_ms = round((time.monotonic() - acquired_at) * 1000, 3)
+            # Deregister *before* the connection goes back to the pool so
+            # the next borrower of this backend is never confused with us.
+            self._registry.finish(request_id, token)
             await self._pool.release_healthy(conn)
             return {
                 "status": "ok",
                 "executed": True,
+                "request_id": request_id,
                 "wait_ms": waited_ms,
                 "execution_ms": elapsed_ms,
                 "row_count": len(rows),
@@ -132,6 +177,8 @@ class QueryExecutor:
         task: asyncio.Task,
         waited_ms: float,
         acquired_at: float,
+        request_id: str,
+        token: int,
         backstop: bool = False,
     ) -> QueryTimeout:
         logger.warning(
@@ -169,6 +216,10 @@ class QueryExecutor:
 
         # 3) Prove transaction end.  If we cannot, drop the backend.
         idle = await self._pool.confirm_idle_or_discard(conn)
+        # Deregister before the connection leaves our hands: the request is
+        # finished (504) and must not be attributed to this backend anymore,
+        # whoever borrows it next.
+        self._registry.finish(request_id, token)
         discarded = False
         if idle:
             await self._pool.release_healthy(conn)
@@ -183,6 +234,7 @@ class QueryExecutor:
             extra={
                 "status": "timeout",
                 "executed": True,
+                "request_id": request_id,
                 "cancelled": cancel_ok,
                 "connection_discarded": discarded,
                 "wait_ms": waited_ms,

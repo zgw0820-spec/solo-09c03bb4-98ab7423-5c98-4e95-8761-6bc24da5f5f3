@@ -13,6 +13,9 @@ Scenarios:
   5. after two concurrent slow queries, later requests still get their own
      results (connection reuse after confirmed rollback)
   6. pool capacity really is two (observed via pg_stat_activity)
+  7. lock-wait diagnostics: real lock waits reported with request id and
+     blocker PID; queued/executing-normally requests never misreported;
+     timed-out requests stop being attributed to a backend
 """
 from __future__ import annotations
 
@@ -89,6 +92,9 @@ def case_health_and_basic() -> None:
     check("普通 SELECT 200", status == 200, body)
     check("返回 ok 且已执行", body["status"] == "ok" and body["executed"], body)
     check("预置 7 条故障日志", body["rows"][0][0] == 7, body)
+    check("回执携带 request_id 供诊断关联",
+          isinstance(body.get("request_id"), str)
+          and len(body["request_id"]) == 32, body)
 
     status, body = post(
         "/query",
@@ -331,6 +337,173 @@ def case_discard_and_rebuild() -> None:
           observed and max(observed) <= 2, f"max={max(observed)}")
 
 
+def _poll_diagnostics(predicate, timeout_s: float = 4.0):
+    """Poll /diagnostics/lock-waits until predicate(body) or timeout."""
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        status, body = get("/diagnostics/lock-waits")
+        if status == 200:
+            last = body
+            if predicate(body):
+                return body
+        time.sleep(0.1)
+    return last
+
+
+def case_lock_wait_diagnostics() -> None:
+    # -- 基线：无在途请求时，诊断为空且诚实 ----------------------------- #
+    status, body = get("/diagnostics/lock-waits")
+    check("诊断接口 200", status == 200, body)
+    check("空闲时无锁等待", body.get("lock_waits") == [], body)
+    check("空闲时无在途请求",
+          body.get("in_flight", {}).get("executing") == 0
+          and body.get("in_flight", {}).get("queued") == 0, body)
+
+    # -- 正常执行的慢 SQL 不得误报为锁等待 ------------------------------ #
+    sleepers: list[tuple] = []
+
+    def nap(tag: str) -> None:
+        sleepers.append(post(
+            "/query",
+            {"sql": f"SELECT '{tag}', pg_sleep(2)", "timeout_ms": 9000},
+            timeout=15,
+        ))
+
+    tn = [threading.Thread(target=nap, args=(t,)) for t in ("N1", "N2")]
+    for t in tn:
+        t.start()
+    body = _poll_diagnostics(
+        lambda b: b.get("in_flight", {}).get("executing") == 2
+    )
+    check("两条 pg_sleep 在途时被观测到",
+          body is not None and body["in_flight"]["executing"] == 2, body)
+    check("正常执行(Timeout 等待)不计为锁等待",
+          body is not None and body["lock_waits"] == [], body)
+    for t in tn:
+        t.join()
+    check("两条 pg_sleep 均成功",
+          len(sleepers) == 2 and all(s == 200 for s, _ in sleepers), sleepers)
+
+    # -- 真实锁等待：报告请求标识、等待类型与阻塞者 PID ------------------ #
+    # 持有者：事务级咨询锁 + pg_sleep，提交时自动放锁，不泄漏到池连接。
+    holder: list[tuple] = []
+    waiter: list[tuple] = []
+
+    def hold() -> None:
+        holder.append(post(
+            "/query",
+            {"sql": "SELECT pg_advisory_xact_lock(777), pg_sleep(4)",
+             "timeout_ms": 12000},
+            timeout=20,
+        ))
+
+    def wait_on_lock() -> None:
+        waiter.append(post(
+            "/query",
+            {"sql": "SELECT pg_advisory_xact_lock(777)", "timeout_ms": 12000},
+            timeout=20,
+        ))
+
+    th = threading.Thread(target=hold)
+    th.start()
+    time.sleep(0.6)  # 持有者已拿到锁并进入 pg_sleep
+    tw = threading.Thread(target=wait_on_lock)
+    tw.start()
+
+    body = _poll_diagnostics(lambda b: len(b.get("lock_waits", [])) == 1)
+    check("观测到恰好一个锁等待",
+          body is not None and len(body["lock_waits"]) == 1, body)
+    entry = (body or {}).get("lock_waits", [{}])[0]
+    check("等待类型为 Lock",
+          entry.get("wait_event_type") == "Lock", entry)
+    check("报告阻塞者 PID",
+          isinstance(entry.get("blocking_pids"), list)
+          and len(entry["blocking_pids"]) >= 1
+          and all(isinstance(p, int) for p in entry["blocking_pids"]), entry)
+    check("锁等待条目带请求标识与后端 PID",
+          isinstance(entry.get("request_id"), str)
+          and isinstance(entry.get("backend_pid"), int), entry)
+    observed_waiter_id = entry.get("request_id")
+
+    # -- 排队请求不得误报：两连接占满时第三个请求只排队 ----------------- #
+    queued: list[tuple] = []
+
+    def queued_req() -> None:
+        queued.append(post(
+            "/query",
+            {"sql": "SELECT 'QUEUED'", "timeout_ms": 700},
+            timeout=10,
+        ))
+
+    tq = threading.Thread(target=queued_req)
+    tq.start()
+    time.sleep(0.3)  # 第三个请求正在排队（预算 700ms 尚未耗尽）
+    status, body = get("/diagnostics/lock-waits")
+    check("排队期间诊断仍 200（监测连接独立可用）", status == 200, body)
+    check("排队请求计入 queued 而非锁等待",
+          body.get("in_flight", {}).get("queued") == 1
+          and len(body.get("lock_waits", [])) == 1, body)
+    tq.join()
+    check("排队请求预算耗尽返回 503",
+          queued and queued[0][0] == 503, queued)
+    check("503 回执带 request_id 且未执行",
+          queued
+          and queued[0][1].get("executed") is False
+          and isinstance(queued[0][1].get("request_id"), str), queued)
+
+    tw.join()
+    th.join()
+    check("持有者与等待者最终各自成功",
+          holder and holder[0][0] == 200 and waiter and waiter[0][0] == 200,
+          (holder, waiter))
+    check("诊断中的请求标识确为等待者本人",
+          waiter and observed_waiter_id == waiter[0][1].get("request_id"),
+          (observed_waiter_id, waiter))
+    check("持有者未被误报为锁等待",
+          holder and observed_waiter_id != holder[0][1].get("request_id"),
+          (observed_waiter_id, holder))
+
+    # -- 超时交错：504 后旧请求不得再挂到该后端 ------------------------- #
+    holder2: list[tuple] = []
+
+    def hold2() -> None:
+        holder2.append(post(
+            "/query",
+            {"sql": "SELECT pg_advisory_xact_lock(888), pg_sleep(3)",
+             "timeout_ms": 12000},
+            timeout=20,
+        ))
+
+    th2 = threading.Thread(target=hold2)
+    th2.start()
+    time.sleep(0.6)
+    status, body = post(
+        "/query",
+        {"sql": "SELECT pg_advisory_xact_lock(888)", "timeout_ms": 900},
+        timeout=15,
+    )
+    check("锁等待超时返回 504", status == 504, body)
+    check("504 回执带 request_id",
+          isinstance(body.get("request_id"), str), body)
+    timed_out_id = body.get("request_id")
+
+    status, body = get("/diagnostics/lock-waits")
+    check("超时后诊断接口可用", status == 200, body)
+    check("超时请求不再归到任何后端",
+          all(w.get("request_id") != timed_out_id
+              for w in body.get("lock_waits", [])), body)
+    check("持有者正常执行不计为锁等待(当前无锁等待)",
+          body.get("lock_waits") == [], body)
+
+    status, body = post(
+        "/query", {"sql": "SELECT 1", "timeout_ms": 5000}
+    )
+    check("超时交错后新查询正常", status == 200 and body["rows"] == [[1]], body)
+    th2.join()
+    check("第二个持有者最终成功", holder2 and holder2[0][0] == 200, holder2)
+
+
 def main() -> int:
     print(f"self-test against {BASE}")
     run_case("1. 健康检查与普通查询", case_health_and_basic)
@@ -339,6 +512,7 @@ def main() -> int:
     run_case("4. 排队期间过期不执行", case_queued_expiry)
     run_case("5. 容量为 2 与接续查询", case_capacity_and_reuse)
     run_case("6. 弃置并补建 / 物理容量", case_discard_and_rebuild)
+    run_case("7. 锁等待诊断", case_lock_wait_diagnostics)
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     return 1 if FAIL else 0
 

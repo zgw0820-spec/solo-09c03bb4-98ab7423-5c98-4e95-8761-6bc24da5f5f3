@@ -6,13 +6,19 @@ concentrate on the hardest correctness guarantees:
 * a statement that finishes just before the cancel request arrives must not
   overwrite the already-decided timeout receipt ("late result");
 * a queued request whose deadline expires never sends a statement;
-* after a timeout the backend is confirmed IDLE before reuse.
+* after a timeout the backend is confirmed IDLE before reuse;
+* lock-wait diagnostics: real lock waits are correlated to the right
+  request id and blocker PID, queued/normal requests are never misreported,
+  timed-out requests are not attributed to re-borrowed backends, and a dead
+  monitoring connection surfaces as DiagnosticsUnavailable — never as a
+  fabricated empty result.
 
 Run:  python tests/test_protocol.py
 """
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import pathlib
 import sys
 import tempfile
@@ -25,9 +31,16 @@ import psycopg  # noqa: E402
 import pgserver  # noqa: E402
 
 from app.config import Settings  # noqa: E402
-from app.errors import PoolAcquireTimeout, QueryTimeout  # noqa: E402
+from app.diagnostics import collect_lock_waits  # noqa: E402
+from app.errors import (  # noqa: E402
+    DiagnosticsUnavailable,
+    PoolAcquireTimeout,
+    QueryTimeout,
+)
 from app.executor import QueryExecutor  # noqa: E402
+from app.monitor import LockMonitor  # noqa: E402
 from app.pool import QueryConnectionPool  # noqa: E402
+from app.registry import InFlightRegistry  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -57,16 +70,25 @@ async def main() -> int:
     with psycopg.connect(fault_admin, autocommit=True) as c, c.cursor() as cur:
         cur.execute(ddl)
         cur.execute("ALTER ROLE fault_ro PASSWORD NULL")
+        cur.execute("ALTER ROLE fault_mon PASSWORD NULL")
     ro = urlunparse(
         urlparse(fault_admin)._replace(
             netloc=urlparse(fault_admin).netloc.replace("postgres", "fault_ro", 1)
         )
     )
+    mon = urlunparse(
+        urlparse(fault_admin)._replace(
+            netloc=urlparse(fault_admin).netloc.replace("postgres", "fault_mon", 1)
+        )
+    )
 
-    settings = Settings(database_dsn=ro, pool_size=2)
+    settings = Settings(database_dsn=ro, pool_size=2, monitor_dsn=mon)
     pool = QueryConnectionPool(settings)
     await pool.open()
-    executor = QueryExecutor(pool, settings)
+    registry = InFlightRegistry()
+    executor = QueryExecutor(pool, settings, registry)
+    monitor = LockMonitor(settings)
+    await monitor.open()
 
     print("=== A. 迟到结果不改写超时回执 ===")
     # The statement (150ms) always outlives the 60ms deadline, so the timeout
@@ -130,6 +152,128 @@ async def main() -> int:
     st = await pool.status()
     check("结束后池满且空闲", st.idle == 2 and st.size == 2, st)
 
+    print("=== D. 注册表 token 语义（旧请求不得误删新登记） ===")
+    reg = InFlightRegistry()
+    rid = reg.enqueue("SELECT 1")
+    tok1 = reg.attach(rid, 111)
+    reg.detach(rid, tok1)
+    snap = [e for e in reg.snapshot() if e.request_id == rid][0]
+    check("detach 后回到 queued 且无后端",
+          snap.state == "queued" and snap.backend_pid is None, snap)
+    tok2 = reg.attach(rid, 222)
+    reg.finish(rid, tok1)  # 旧 token 的迟到清理
+    snap = [e for e in reg.snapshot() if e.request_id == rid]
+    check("旧 token 不得删除新登记",
+          len(snap) == 1 and snap[0].backend_pid == 222, snap)
+    reg.finish(rid, tok2)
+    check("正确 token 完成注销", reg.snapshot() == [], reg.snapshot())
+
+    print("=== E. 锁等待被关联到正确请求与阻塞者 ===")
+    admin = psycopg.connect(fault_admin, autocommit=True)
+    acur = admin.cursor()
+    acur.execute("SELECT pg_backend_pid()")
+    admin_pid = acur.fetchone()[0]
+    acur.execute("SELECT pg_advisory_lock(99)")  # 管理会话持锁
+
+    waiter_t = asyncio.ensure_future(executor.execute(
+        "SELECT pg_advisory_xact_lock(99)", time.monotonic() + 8))
+    napper_t = asyncio.ensure_future(executor.execute(
+        "SELECT pg_sleep(2.5)", time.monotonic() + 8))
+    await asyncio.sleep(0.5)
+    queued_t = asyncio.ensure_future(executor.execute(
+        "SELECT 'Q'", time.monotonic() + 6))
+    await asyncio.sleep(0.4)
+
+    report = await collect_lock_waits(registry, monitor)
+    check("恰好一个锁等待", len(report["lock_waits"]) == 1, report)
+    check("在途统计: 2 执行 + 1 排队",
+          report["in_flight"] == {"executing": 2, "queued": 1}, report)
+    lock_wait_rid = None
+    if report["lock_waits"]:
+        entry = report["lock_waits"][0]
+        check("等待类型 Lock/advisory",
+              entry["wait_event_type"] == "Lock"
+              and entry["wait_event"] == "advisory", entry)
+        check("阻塞者为管理会话 PID",
+              entry["blocking_pids"] == [admin_pid], entry)
+        lock_wait_rid = entry["request_id"]
+    acur.execute("SELECT pg_advisory_unlock(99)")
+    waiter_res, napper_res, queued_res = await asyncio.gather(
+        waiter_t, napper_t, queued_t)
+    check("锁等待者拿到锁后成功", waiter_res["status"] == "ok", waiter_res)
+    check("诊断中的请求标识确为等待者",
+          lock_wait_rid == waiter_res["request_id"],
+          (lock_wait_rid, waiter_res["request_id"]))
+    check("正常执行与排队者均未被误报",
+          napper_res["request_id"] != lock_wait_rid
+          and queued_res["request_id"] != lock_wait_rid, report)
+
+    print("=== F. 超时交错：旧请求不得归到重新借出的后端 ===")
+    acur.execute("SELECT pg_advisory_lock(98)")
+    timed_out_rid = None
+    try:
+        await executor.execute(
+            "SELECT pg_advisory_xact_lock(98)", time.monotonic() + 0.6)
+        check("锁等待超时必抛 QueryTimeout", False)
+    except QueryTimeout as exc:
+        timed_out_rid = exc.extra.get("request_id")
+        check("锁等待超时回执带 request_id", timed_out_rid is not None,
+              exc.extra)
+    report = await collect_lock_waits(registry, monitor)
+    check("超时后无锁等待记录",
+          report["lock_waits"] == [], report)
+    check("注册表已清空", registry.snapshot() == [], registry.snapshot())
+    reused = await executor.execute("SELECT 5", time.monotonic() + 5)
+    check("同一后端重新借出后返回自身结果", reused["rows"] == [[5]], reused)
+    report = await collect_lock_waits(registry, monitor)
+    check("复用后旧请求不出现",
+          all(w["request_id"] != timed_out_rid
+              for w in report["lock_waits"]), report)
+    acur.execute("SELECT pg_advisory_unlock(98)")
+
+    print("=== G. 监测失败须明确报告，不得返回假空结果 ===")
+    bad_settings = dataclasses.replace(
+        settings, monitor_dsn="postgresql://fault_mon@127.0.0.1:1/faultdb",
+        connect_timeout=2.0)
+    bad_monitor = LockMonitor(bad_settings)
+    # 无在途执行时不需要监测连接，空结果是真实的。
+    empty_report = await collect_lock_waits(InFlightRegistry(), bad_monitor)
+    check("无执行中请求时诚实返回空(不依赖监测)",
+          empty_report["lock_waits"] == []
+          and empty_report["backends_checked"] == 0, empty_report)
+
+    acur.execute("SELECT pg_advisory_lock(97)")
+    hanging_t = asyncio.ensure_future(executor.execute(
+        "SELECT pg_advisory_xact_lock(97)", time.monotonic() + 8))
+    await asyncio.sleep(0.5)
+    try:
+        await collect_lock_waits(registry, bad_monitor)
+        check("监测连接不可用应抛 DiagnosticsUnavailable", False)
+    except DiagnosticsUnavailable as exc:
+        check("监测连接不可用抛 DiagnosticsUnavailable", True, exc)
+    # 好监测连接确认该请求确实在锁等待（失败时不得假报为空）。
+    report = await collect_lock_waits(registry, monitor)
+    check("监测恢复后看到同一锁等待",
+          len(report["lock_waits"]) == 1, report)
+
+    # 监测后端被带外终止：允许一次诚实失败，随后必须自动重连恢复。
+    acur.execute(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+        "WHERE application_name = 'fault-lock-monitor'")
+    await asyncio.sleep(0.3)
+    try:
+        report = await collect_lock_waits(registry, monitor)
+    except DiagnosticsUnavailable:
+        report = await collect_lock_waits(registry, monitor)
+    check("监测后端被杀后自动重连且结果正确",
+          len(report["lock_waits"]) == 1, report)
+    acur.execute("SELECT pg_advisory_unlock(97)")
+    hanging_res = await hanging_t
+    check("被挂起请求解锁后成功", hanging_res["status"] == "ok", hanging_res)
+
+    acur.close()
+    admin.close()
+    await monitor.close()
     await pool.close()
     pg.cleanup()
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")

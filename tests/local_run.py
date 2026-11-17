@@ -62,12 +62,18 @@ def main() -> None:
     ro_dsn = urlunparse(ro_parts._replace(netloc=ro_parts.netloc.replace(
         ro_parts.username or "postgres", "fault_ro", 1
     )))
+    mon_dsn = urlunparse(ro_parts._replace(netloc=ro_parts.netloc.replace(
+        ro_parts.username or "postgres", "fault_mon", 1
+    )))
     with psycopg.connect(fault_admin_dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER ROLE fault_ro PASSWORD NULL")
+            cur.execute("ALTER ROLE fault_mon PASSWORD NULL")
     print(f"[local_run] read-only DSN={ro_dsn}")
+    print(f"[local_run] monitor  DSN={mon_dsn}")
 
     os.environ["DATABASE_DSN"] = ro_dsn
+    os.environ["MONITOR_DSN"] = mon_dsn
     os.environ["POOL_SIZE"] = "2"
     # Exposed for tests/selftest.py's discard/rebuild chaos scenario.
     admin_dsn_path = pathlib.Path(tempfile.gettempdir()) / "faultdb_admin_dsn"
